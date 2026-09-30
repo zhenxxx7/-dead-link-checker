@@ -8,7 +8,7 @@ on:
 jobs:
   run-scanner:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 35
 
     steps:
       - name: Checkout Repository
@@ -19,26 +19,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
-
-      - name: Install Python Packages & Playwright
-        run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
+      - name: Install Python Packages
+        run: pip install -r requirements.txt
 
       - name: Run Script
         env:
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-        run: |
-          python dlc_sheets.py
+          TARGET_URL: https://www.emservices.com.sg/
+          PYTHONUNBUFFERED: '1'
+        run: python dlc_sheets.py
 
-      - name: Upload Debug Screenshots
+      - name: Upload Scan Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: debug_*.png
+          name: scan-report
+          path: |
+            scan_report.csv
+            scan_status.json
           if-no-files-found: ignore

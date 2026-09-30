@@ -1,5 +1,0 @@
-- name: Run Script
-        env:
-          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
-        run: |
-          python dlc_sheets.py
