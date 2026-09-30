@@ -1,0 +1,38 @@
+name: Scheduled Dead Link Checker
+
+on:
+  schedule:
+    # Berjalan otomatis tiap hari jam 03.00 UTC (10.00 WIB)
+    - cron: '0 3 * * *'
+  # Memungkinkan trigger manual lewat tombol Run workflow
+  workflow_dispatch:
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python Packages & Playwright
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run Script
+        env:
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+        run: |
+          python dlc_sheets.py
