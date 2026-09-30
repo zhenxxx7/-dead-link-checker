@@ -29,7 +29,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 '<a href="/good">Good page</a>'
                 '<a href="/missing#fragment">Missing page</a>'
                 '<a href="/private">Do not crawl</a>'
-                '<img src="/asset.png">',
+                '<img src="/asset.png">'
+                '<link rel="alternate" type="application/json" href="/meta">',
                 "text/html",
             )
         elif path == "/good":
@@ -59,6 +60,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_body(200, "not HTML", "text/plain")
         elif path == "/asset.png":
             self.send_body(200, "image", "image/png")
+        elif path == "/meta":
+            self.send_body(200, '{"page": true}', "application/json")
         else:
             self.send_body(500, "unexpected path", "text/plain")
 
@@ -131,6 +134,8 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.server.calls.count("/missing"), 1)
         self.assertIn("/hidden", self.server.calls)
         self.assertIn("/asset.png", self.server.calls)
+        self.assertIn("/meta", self.server.calls)
+        self.assertEqual(scanner.page_count, 9)
         self.assertNotIn("/private", self.server.calls)
         listed_issue = next(issue for issue in issues if issue.url.endswith("/sitemap-broken"))
         self.assertTrue(listed_issue.source_text.startswith("Listed broken | source:"))

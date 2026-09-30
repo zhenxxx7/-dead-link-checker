@@ -56,14 +56,14 @@ class LinkParser(HTMLParser):
         if tag == "a" and attrs.get("href"):
             self._anchor = [attrs["href"], []]
         elif tag in ("img", "script", "iframe", "source") and attrs.get("src"):
-            self.links.append((attrs["src"], tag))
+            self.links.append((attrs["src"], tag, False))
         elif tag == "link" and attrs.get("href"):
-            self.links.append((attrs["href"], "link"))
+            self.links.append((attrs["href"], "link", False))
         if tag in ("img", "source") and attrs.get("srcset"):
             for candidate in attrs["srcset"].split(","):
                 url = candidate.strip().split()
                 if url:
-                    self.links.append((url[0], f"{tag} srcset"))
+                    self.links.append((url[0], f"{tag} srcset", False))
 
     def handle_data(self, data):
         if self._anchor is not None:
@@ -72,7 +72,7 @@ class LinkParser(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "a" and self._anchor is not None:
             url, parts = self._anchor
-            self.links.append((url, " ".join("".join(parts).split()) or "link"))
+            self.links.append((url, " ".join("".join(parts).split()) or "link", True))
             self._anchor = None
 
 
@@ -105,7 +105,7 @@ def check_url(url):
 
 
 class SiteScanner:
-    def __init__(self, target, max_pages=750, max_urls=5000, deadline_seconds=1500):
+    def __init__(self, target, max_pages=750, max_urls=5000, deadline_seconds=2100):
         self.target = normalize_url(target, target)
         if not self.target:
             raise ValueError(f"Invalid TARGET_URL: {target!r}")
@@ -258,21 +258,22 @@ class SiteScanner:
                         parser = LinkParser()
                         parser.feed(html)
                         base = normalize_url(parser.base_href, final_url) if parser.base_href else final_url
-                        for raw, label in parser.links:
+                        for raw, label, crawl in parser.links:
                             linked_url = normalize_url(raw, base or final_url)
-                            self._add(linked_url, label, final_url, crawl=True)
+                            self._add(linked_url, label, final_url, crawl=crawl)
                     if self.page_count % 25 == 0:
-                        print(f"Pages: {self.page_count}; URLs found: {len(self.discovered)}; issues: {len(self.issues)}", flush=True)
+                        print(f"Pages: {self.page_count}; pages queued: {len(self.pages)}; "
+                              f"URLs found: {len(self.discovered)}; issues: {len(self.issues)}", flush=True)
                 time.sleep(0.2)
 
     def _check_remaining_links(self):
         remaining = sorted(self.check_only - self.checked)
         if not remaining:
             return
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            for offset in range(0, len(remaining), 6):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for offset in range(0, len(remaining), 8):
                 self._time_left()
-                batch = remaining[offset:offset + 6]
+                batch = remaining[offset:offset + 8]
                 futures = {pool.submit(check_url, url): url for url in batch}
                 for future in as_completed(futures):
                     self._time_left()
@@ -281,7 +282,7 @@ class SiteScanner:
                     status = future.result()
                     if status:
                         self._record(url, status)
-                if len(self.checked) % 100 < 6:
+                if len(self.checked) % 100 < 8:
                     print(f"Checked: {len(self.checked)} URLs; issues: {len(self.issues)}", flush=True)
         self._time_left()
 
@@ -314,6 +315,8 @@ def write_status(scanner, complete, error, path="scan_status.json"):
             "pages_checked": scanner.page_count,
             "urls_discovered": len(scanner.discovered),
             "urls_checked": len(scanner.checked),
+            "pages_pending": len(scanner.pages),
+            "links_pending": len(scanner.check_only - scanner.checked),
             "issues": len(scanner.issues),
             "sitemaps_read": scanner.sitemap_count,
         }, status_file, indent=2)
