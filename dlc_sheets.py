@@ -4,7 +4,7 @@ import re
 import time
 from datetime import datetime
 import requests
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import pytesseract
 from playwright.sync_api import sync_playwright
 
@@ -12,7 +12,7 @@ WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL")
 
 def push_to_sheets(rows_data):
     if not rows_data:
-        print("Tidak ada broken link ditemukan.")
+        print("Tidak ada broken link yang perlu dikirim.")
         return
     
     if not WEBHOOK_URL:
@@ -22,15 +22,43 @@ def push_to_sheets(rows_data):
     res = requests.post(WEBHOOK_URL, json={"rows": rows_data})
     print(f"Status kirim Sheets: {res.status_code} - {res.text}")
 
-def solve_captcha_text(page):
-    captcha_img = page.query_selector('img[src*="captcha"], .captcha img, img[alt*="captcha"]')
-    if not captcha_img:
-        return ""
+def clean_and_read_captcha(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes)).convert("L")
+    img = img.resize((img.width * 3, img.height * 3), Image.Resampling.LANCZOS)
+    img = img.filter(ImageFilter.SHARPEN)
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2.5)
     
-    img_bytes = captcha_img.screenshot()
-    img = Image.open(io.BytesIO(img_bytes)).convert("L")  # grayscale untuk akurasi OCR lebih tinggi
-    code = pytesseract.image_to_string(img, config="--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    return re.sub(r"[^A-Za-z]", "", code).strip().upper()
+    threshold = 140
+    img = img.point(lambda p: 255 if p > threshold else 0)
+    
+    code = pytesseract.image_to_string(
+        img, 
+        config="--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    )
+    return re.sub(r"[^A-Za-z0-9]", "", code).strip().upper()
+
+def handle_captcha_if_exists(page):
+    captcha_box = page.query_selector('div:has-text("Enter code:"), td:has-text("Enter code:"), #captcha, .captcha')
+    captcha_input = page.query_selector('input[name*="code"], input[name*="captcha"], #code')
+    captcha_img = page.query_selector('img[src*="captcha"], img[alt*="captcha"]')
+    
+    if captcha_input and captcha_input.is_visible() and captcha_img:
+        print("-> Terdeteksi form CAPTCHA! Mengambil gambar...")
+        img_bytes = captcha_img.screenshot()
+        code = clean_and_read_captcha(img_bytes)
+        print(f"-> Hasil baca OCR: {code}")
+        
+        captcha_input.fill("")
+        captcha_input.fill(code)
+        time.sleep(1)
+        
+        action_btn = page.query_selector('input[value="resume"], button:has-text("resume"), input[value="check"], button:has-text("check")')
+        if action_btn:
+            action_btn.click()
+            time.sleep(3)
+        return True
+    return False
 
 def main():
     with sync_playwright() as p:
@@ -43,7 +71,7 @@ def main():
             ]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 768}
         )
         page = context.new_page()
@@ -57,41 +85,43 @@ def main():
         if url_input:
             url_input.fill("https://www.emservices.com.sg")
 
-        # Handle CAPTCHA loop (coba sampai 3 kali jika salah baca)
-        for attempt in range(1, 4):
-            captcha_input = page.query_selector('input[name*="code"], input[name*="captcha"], #code')
-            if not captcha_input or not captcha_input.is_visible():
+        # Klik tombol check awal untuk mentrigger form / scan
+        submit_btn = page.query_selector('input[value="check"], button:has-text("check")')
+        if submit_btn:
+            print("2b. Menekan tombol check awal...")
+            submit_btn.click()
+            time.sleep(3)
+
+        print("3. Memantau progres pemindaian...")
+        max_wait = 1800  # Maksimal 30 menit
+        interval = 5
+        elapsed = 0
+        scan_completed = False
+
+        while elapsed < max_wait:
+            time.sleep(interval)
+            elapsed += interval
+
+            # Cek jika scan sudah selesai (100% atau Scan completed atau muncul tombol Full report)
+            if (page.query_selector('text=Scan completed') or 
+                page.query_selector('text=100% scanned') or 
+                page.query_selector('a:has-text("Full report")')):
+                scan_completed = True
+                print("Proses scan selesai 100%!")
                 break
 
-            clean_code = solve_captcha_text(page)
-            print(f"Percobaan CAPTCHA #{attempt}: {clean_code}")
-            captcha_input.fill(clean_code)
+            # Cek dan selesaikan CAPTCHA jika muncul (baik di awal atau terjeda di tengah scan)
+            handle_captcha_if_exists(page)
 
-            submit_btn = page.query_selector('input[value="check"], input[value="resume"], button:has-text("check")')
-            if submit_btn:
-                submit_btn.click()
+            if elapsed % 30 == 0:
+                print(f"Scanning berjalan... ({elapsed} detik)")
 
-            time.sleep(4)
+        page.screenshot(path="debug_final_state.png")
 
-            # Cek jika proses scan sudah berhasil dimulai
-            if page.query_selector('text=scanned') or page.query_selector('text=Scanning'):
-                print("CAPTCHA berhasil, proses scan berjalan...")
-                break
+        if not scan_completed:
+            raise TimeoutError("Scan tidak mencapai 100% dalam 30 menit.")
 
-        # Simpan screenshot awal untuk monitoring status berjalan
-        page.screenshot(path="debug_running.png")
-
-        print("3. Menunggu pemindaian selesai...")
-        try:
-            page.wait_for_selector("text=100% scanned", timeout=1800000)
-            page.wait_for_selector("text=Scan completed", timeout=60000)
-            print("Scan selesai 100%!")
-        except Exception as e:
-            print(f"Error saat scan: {e}")
-            page.screenshot(path="debug_error.png")
-            raise e
-
-        # Ekstrak link bermasalah
+        print("4. Mengambil data link yang rusak...")
         rows = page.query_selector_all("table tr")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         to_insert = []
@@ -105,7 +135,7 @@ def main():
                 if any(x in status.lower() for x in ["40", "50", "timeout", "-1", "failed"]):
                     to_insert.append([now, status, url, source_text])
 
-        print(f"Ditemukan {len(to_insert)} link mati.")
+        print(f"Ditemukan {len(to_insert)} link bermasalah.")
         push_to_sheets(to_insert)
         browser.close()
 
