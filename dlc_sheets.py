@@ -58,12 +58,11 @@ class LinkParser(HTMLParser):
         elif tag in ("img", "script", "iframe", "source") and attrs.get("src"):
             self.links.append((attrs["src"], tag, False))
         elif tag == "link" and attrs.get("href"):
-            self.links.append((attrs["href"], "link", False))
-        if tag in ("img", "source") and attrs.get("srcset"):
-            for candidate in attrs["srcset"].split(","):
-                url = candidate.strip().split()
-                if url:
-                    self.links.append((url[0], f"{tag} srcset", False))
+            # Stylesheets and icons are assets. WordPress shortlinks and REST
+            # alternates duplicate page URLs and can be extremely slow.
+            rel = set(attrs.get("rel", "").lower().split())
+            if rel.intersection({"stylesheet", "icon", "apple-touch-icon", "manifest"}):
+                self.links.append((attrs["href"], "link", False))
 
     def handle_data(self, data):
         if self._anchor is not None:

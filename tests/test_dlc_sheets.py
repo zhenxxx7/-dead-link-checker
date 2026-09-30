@@ -29,8 +29,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 '<a href="/good">Good page</a>'
                 '<a href="/missing#fragment">Missing page</a>'
                 '<a href="/private">Do not crawl</a>'
-                '<img src="/asset.png">'
-                '<link rel="alternate" type="application/json" href="/meta">',
+                '<img src="/asset.png" srcset="/large.png 2x">'
+                '<link rel="alternate" type="application/json" href="/meta">'
+                '<link rel="shortlink" href="/?p=1">'
+                '<link rel="stylesheet" href="/style.css">',
                 "text/html",
             )
         elif path == "/good":
@@ -60,6 +62,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.send_body(200, "not HTML", "text/plain")
         elif path == "/asset.png":
             self.send_body(200, "image", "image/png")
+        elif path == "/style.css":
+            self.send_body(200, "body {}", "text/css")
         elif path == "/meta":
             self.send_body(200, '{"page": true}', "application/json")
         else:
@@ -134,7 +138,10 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(self.server.calls.count("/missing"), 1)
         self.assertIn("/hidden", self.server.calls)
         self.assertIn("/asset.png", self.server.calls)
-        self.assertIn("/meta", self.server.calls)
+        self.assertIn("/style.css", self.server.calls)
+        self.assertNotIn("/meta", self.server.calls)
+        self.assertNotIn("/large.png", self.server.calls)
+        self.assertNotIn(self.base + "/?p=1", scanner.discovered)
         self.assertEqual(scanner.page_count, 9)
         self.assertNotIn("/private", self.server.calls)
         listed_issue = next(issue for issue in issues if issue.url.endswith("/sitemap-broken"))
