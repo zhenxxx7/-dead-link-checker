@@ -2,9 +2,7 @@ name: Scheduled Dead Link Checker
 
 on:
   schedule:
-    # Berjalan otomatis tiap hari jam 03.00 UTC (10.00 WIB)
     - cron: '0 3 * * *'
-  # Memungkinkan trigger manual lewat tombol Run workflow
   workflow_dispatch:
 
 jobs:
@@ -36,3 +34,11 @@ jobs:
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
         run: |
           python dlc_sheets.py
+
+      - name: Upload Debug Screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: debug_*.png
+          if-no-files-found: ignore
