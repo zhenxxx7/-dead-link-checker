@@ -1,0 +1,53 @@
+name: Provider Site Check
+
+on:
+  schedule:
+    # 00:30 Singapore time / WITA on the following day (UTC+8).
+    - cron: '30 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  site-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tesseract
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python packages and Chromium
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run Dead Link Checker Site Check
+        env:
+          PYTHONUNBUFFERED: '1'
+          SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+        run: >-
+          python provider_site_check.py
+          --target https://www.emservices.com.sg/
+          --output-dir reports
+          --max-minutes 120
+          --ocr-captcha
+
+      - name: Upload provider report and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-site-check-${{ github.run_id }}
+          path: reports/
+          if-no-files-found: warn
