@@ -2,8 +2,10 @@ name: Provider Site Check
 
 on:
   schedule:
-    # 00:30 Singapore time / WITA on the following day (UTC+8).
-    - cron: '30 16 * * *'
+    # 06:00, 13:00, and 19:00 Singapore time / WITA (UTC+8).
+    - cron: '0 22 * * *' # 06:00 on the following day
+    - cron: '0 5 * * *'  # 13:00 on the same day
+    - cron: '0 11 * * *' # 19:00 on the same day
   workflow_dispatch:
 
 permissions:
@@ -12,7 +14,7 @@ permissions:
 jobs:
   site-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 200
 
     steps:
       - name: Check out repository
@@ -41,7 +43,8 @@ jobs:
           python provider_site_check.py
           --target https://www.emservices.com.sg/
           --output-dir reports
-          --max-minutes 120
+          --max-minutes 60
+          --scan-attempts 3
           --ocr-captcha
 
       - name: Upload provider report and diagnostics

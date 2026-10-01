@@ -19,7 +19,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 SITE_CHECK_URL = "https://www.deadlinkchecker.com/website-dead-link-checker.asp"
@@ -31,6 +31,10 @@ CAPTCHA_RESPONSE_SECONDS = 30
 
 class ScanFailure(RuntimeError):
     pass
+
+
+class CaptchaFailure(ScanFailure):
+    """The image code could not be read or accepted."""
 
 
 def now_sgt() -> str:
@@ -116,7 +120,7 @@ def captcha_code(image_bytes: bytes) -> str:
             if 3 <= len(candidate) <= 8:
                 votes[candidate] += 1
     if not votes:
-        raise ScanFailure("OCR could not read the provider's image code.")
+        raise CaptchaFailure("OCR could not read the provider's image code.")
     return votes.most_common(1)[0][0]
 
 
@@ -170,9 +174,11 @@ def send_to_sheets(target: str, snapshot: dict, rows: list[list[str]]) -> None:
     print(f"Sheets webhook accepted {len(sheet_rows)} rows.", flush=True)
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
     started = datetime.now(SGT)
-    run_dir = Path(args.output_dir) / started.strftime("%Y-%m-%d_%H-%M-%S_SGT")
+    run_dir = Path(args.output_dir) / (
+        started.strftime("%Y-%m-%d_%H-%M-%S_SGT") + f"_attempt-{attempt_number}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "provider": SITE_CHECK_URL,
@@ -182,6 +188,7 @@ def run(args: argparse.Namespace) -> int:
         "scan_complete": False,
         "delivery_complete": False,
         "ocr_captcha": args.ocr_captcha,
+        "scan_attempt": attempt_number,
         "captcha_attempts": 0,
         "state": "starting",
         "error": None,
@@ -190,6 +197,7 @@ def run(args: argparse.Namespace) -> int:
     browser = None
     snapshot: dict = {}
     exit_code = 1
+    retryable = False
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -246,16 +254,19 @@ def run(args: argparse.Namespace) -> int:
                     if args.ocr_captcha and "sec.asp" in src:
                         if src not in submitted_sources:
                             if metadata["captcha_attempts"] >= args.captcha_attempts:
-                                raise ScanFailure(
+                                raise CaptchaFailure(
                                     f"Image code rejected after {args.captcha_attempts} attempts."
                                 )
                             metadata["captcha_attempts"] += 1
-                            page.wait_for_function(
-                                "() => { const image = document.querySelector('#captcha'); "
-                                "return image && image.src.includes('/sec.asp') "
-                                "&& image.complete && image.naturalWidth > 0; }",
-                                timeout=15000,
-                            )
+                            try:
+                                page.wait_for_function(
+                                    "() => { const image = document.querySelector('#captcha'); "
+                                    "return image && image.src.includes('/sec.asp') "
+                                    "&& image.complete && image.naturalWidth > 0; }",
+                                    timeout=15000,
+                                )
+                            except PlaywrightTimeoutError as exc:
+                                raise CaptchaFailure("Provider image code did not load.") from exc
                             png = page.locator("#captcha").screenshot()
                             (run_dir / f"captcha-{metadata['captcha_attempts']}.png").write_bytes(png)
                             code = captcha_code(png)
@@ -271,7 +282,7 @@ def run(args: argparse.Namespace) -> int:
                             submitted_sources.add(src)
                             last_submission = time.monotonic()
                         elif time.monotonic() - last_submission > CAPTCHA_RESPONSE_SECONDS:
-                            raise ScanFailure("Provider did not advance after image code entry.")
+                            raise CaptchaFailure("Provider did not advance after image code entry.")
                     elif not args.ocr_captcha and src != last_manual_prompt:
                         print(
                             "Enter the displayed image code in the browser, then click "
@@ -321,6 +332,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"Complete provider report: {run_dir.resolve()}", flush=True)
     except (Exception, KeyboardInterrupt) as exc:
         metadata["error"] = f"{type(exc).__name__}: {exc}"
+        retryable = isinstance(exc, CaptchaFailure)
         if not metadata["scan_complete"]:
             metadata["state"] = "failed"
         print(f"ERROR: {metadata['error']}", file=sys.stderr, flush=True)
@@ -332,7 +344,24 @@ def run(args: argparse.Namespace) -> int:
             metadata.setdefault("provider_status", snapshot.get("status_text"))
             metadata.setdefault("provider_statistics", snapshot.get("statistics_text"))
         save_json(run_dir / "scan_status.json", metadata)
-    return exit_code
+    return exit_code, retryable
+
+
+def run_with_retries(args: argparse.Namespace) -> int:
+    for attempt_number in range(1, args.scan_attempts + 1):
+        exit_code, retryable = run(args, attempt_number)
+        if exit_code == 0:
+            return 0
+        if not (args.ocr_captcha and retryable and attempt_number < args.scan_attempts):
+            return exit_code
+        print(
+            f"Image code failed; starting fresh provider scan "
+            f"{attempt_number + 1}/{args.scan_attempts} in "
+            f"{args.retry_delay_seconds} seconds.",
+            flush=True,
+        )
+        time.sleep(args.retry_delay_seconds)
+    return 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -342,14 +371,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-minutes", type=int, default=120)
     parser.add_argument("--ocr-captcha", action="store_true")
     parser.add_argument("--captcha-attempts", type=int, default=6)
+    parser.add_argument("--scan-attempts", type=int, default=3)
+    parser.add_argument("--retry-delay-seconds", type=int, default=20)
     parser.add_argument("--headed", action="store_true", help="Show browser during OCR mode")
     args = parser.parse_args()
-    if args.max_minutes < 1 or args.captcha_attempts < 1:
-        parser.error("Timeout and CAPTCHA attempt count must be positive.")
+    if args.max_minutes < 1 or args.captcha_attempts < 1 or args.scan_attempts < 1:
+        parser.error("Timeout and attempt counts must be positive.")
+    if args.retry_delay_seconds < 0:
+        parser.error("Retry delay cannot be negative.")
     if not args.target.startswith(("https://", "http://")):
         parser.error("Target must include http:// or https://.")
     return args
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(parse_args()))
+    raise SystemExit(run_with_retries(parse_args()))
