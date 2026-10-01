@@ -220,13 +220,11 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
             print(f"Provider scan requested for {args.target}", flush=True)
             metadata["state"] = "scanning"
 
-            deadline = time.monotonic() + args.max_minutes * 60
             last_progress_log = 0.0
             submitted_sources: set[str] = set()
             last_submission = 0.0
             last_manual_prompt = ""
-            done_since = None
-            while time.monotonic() < deadline:
+            while True:
                 if page.is_closed():
                     raise ScanFailure("Provider browser page closed before scan completed.")
                 snapshot = browser_snapshot(page)
@@ -240,12 +238,6 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
                     break
                 if classification != "pending":
                     raise ScanFailure(f"Provider scan ended: {classification}.")
-                if snapshot["state"] == 3:
-                    done_since = done_since or time.monotonic()
-                    if time.monotonic() - done_since > 15:
-                        raise ScanFailure(
-                            "Provider entered DONE state without a complete 100% report."
-                        )
                 if snapshot["current_page"].split("?")[0] != SITE_CHECK_URL:
                     raise ScanFailure("Provider left the Site Check page before completion.")
 
@@ -301,9 +293,6 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
                     )
                     last_progress_log = now
                 page.wait_for_timeout(POLL_SECONDS * 1000)
-            else:
-                raise ScanFailure(f"Provider scan did not finish in {args.max_minutes} minutes.")
-
             report_html = page.evaluate("reporttext")
             if "DeadLinkChecker.com - report" not in report_html:
                 raise ScanFailure("Provider did not generate its full report.")
@@ -368,15 +357,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", default=DEFAULT_TARGET)
     parser.add_argument("--output-dir", default="reports")
-    parser.add_argument("--max-minutes", type=int, default=120)
     parser.add_argument("--ocr-captcha", action="store_true")
     parser.add_argument("--captcha-attempts", type=int, default=6)
     parser.add_argument("--scan-attempts", type=int, default=3)
     parser.add_argument("--retry-delay-seconds", type=int, default=20)
     parser.add_argument("--headed", action="store_true", help="Show browser during OCR mode")
     args = parser.parse_args()
-    if args.max_minutes < 1 or args.captcha_attempts < 1 or args.scan_attempts < 1:
-        parser.error("Timeout and attempt counts must be positive.")
+    if args.captcha_attempts < 1 or args.scan_attempts < 1:
+        parser.error("Attempt counts must be positive.")
     if args.retry_delay_seconds < 0:
         parser.error("Retry delay cannot be negative.")
     if not args.target.startswith(("https://", "http://")):

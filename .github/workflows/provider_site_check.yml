@@ -14,7 +14,6 @@ permissions:
 jobs:
   site-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 200
 
     steps:
       - name: Check out repository
@@ -43,7 +42,6 @@ jobs:
           python provider_site_check.py
           --target https://www.emservices.com.sg/
           --output-dir reports
-          --max-minutes 60
           --scan-attempts 3
           --ocr-captcha
 
