@@ -37,6 +37,10 @@ class CaptchaFailure(ScanFailure):
     """The image code could not be read or accepted."""
 
 
+class InconclusiveScan(ScanFailure):
+    """The provider finished, but the crawl is unreliable as a client report."""
+
+
 def now_sgt() -> str:
     return datetime.now(SGT).isoformat(timespec="seconds")
 
@@ -132,6 +136,31 @@ def result_rows(page) -> list[list[str]]:
     )
 
 
+def report_quality_issues(
+    target: str,
+    snapshot: dict,
+    rows: list[list[str]],
+    *,
+    min_checked: int,
+    max_timeout_rows: int | None,
+) -> list[str]:
+    """Reject provider-complete reports with signs of a truncated crawl."""
+    issues = []
+    checked = snapshot.get("checked")
+    if min_checked and (not isinstance(checked, int) or checked < min_checked):
+        issues.append(f"only {checked} URLs checked; expected at least {min_checked}")
+
+    timeout_rows = [row for row in rows if row and "timeout" in row[0].lower()]
+    if max_timeout_rows is not None and len(timeout_rows) > max_timeout_rows:
+        issues.append(f"{len(timeout_rows)} timeout rows; maximum {max_timeout_rows}")
+    if any(
+        len(row) > 1 and row[1].rstrip("/").lower() == target.rstrip("/").lower()
+        for row in timeout_rows
+    ):
+        issues.append("target homepage timed out")
+    return issues
+
+
 def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -150,31 +179,84 @@ def save_browser_evidence(page, run_dir: Path, *, completed: bool) -> None:
         print(f"Could not save page HTML: {exc}", flush=True)
 
 
-def send_to_sheets(target: str, snapshot: dict, rows: list[list[str]]) -> None:
+def spreadsheet_batch(
+    target: str,
+    snapshot: dict,
+    rows: list[list[str]],
+    *,
+    stamp: str,
+    run_id: str,
+    event_name: str,
+    repository: str,
+    status: str,
+    note: str,
+) -> list[list[str]]:
+    run_url = (
+        f"https://github.com/{repository}/actions/runs/{run_id}"
+        if repository and run_id
+        else "Local run"
+    )
+    details = (
+        "Dead Link Checker Site Check; "
+        f"{snapshot['percent']}% scanned; {snapshot['checked']} checked; "
+        f"{snapshot['failed'] + snapshot['denied']} provider errors"
+    )
+    if note:
+        details += f"; {note}"
+    return [
+        ["\u00a0", "\u00a0", "\u00a0", "\u00a0"],
+        [stamp, f"SCAN START ({event_name or 'local'})", target, run_url],
+        [stamp, status, target, details],
+        *[[stamp, *row] for row in rows],
+    ]
+
+
+def send_to_sheets(
+    target: str,
+    snapshot: dict,
+    rows: list[list[str]],
+    *,
+    status: str = "SCAN COMPLETE",
+    note: str = "",
+) -> bool:
     webhook = os.environ.get("SHEET_WEBHOOK_URL")
     if not webhook:
         print("No SHEET_WEBHOOK_URL; report saved in Action artifact only.", flush=True)
-        return
+        return False
     import requests
 
-    stamp = now_sgt()
-    summary = [
-        stamp,
-        "SCAN COMPLETE",
+    sheet_rows = spreadsheet_batch(
         target,
-        (
-            "Dead Link Checker Site Check; "
-            f"{snapshot['percent']}% scanned; {snapshot['checked']} checked; "
-            f"{snapshot['failed'] + snapshot['denied']} errors"
-        ),
-    ]
-    sheet_rows = [summary] + [[stamp, *row] for row in rows]
-    response = requests.post(webhook, json={"rows": sheet_rows}, timeout=30)
-    response.raise_for_status()
+        snapshot,
+        rows,
+        stamp=now_sgt(),
+        run_id=os.environ.get("GITHUB_RUN_ID", ""),
+        event_name=os.environ.get("GITHUB_EVENT_NAME", ""),
+        repository=os.environ.get("GITHUB_REPOSITORY", ""),
+        status=status,
+        note=note,
+    )
+    try:
+        response = requests.post(webhook, json={"rows": sheet_rows}, timeout=30)
+    except requests.RequestException as exc:
+        raise ScanFailure(f"Sheets webhook request failed: {type(exc).__name__}") from None
+    if not response.ok:
+        raise ScanFailure(f"Sheets webhook returned HTTP {response.status_code}")
+    try:
+        result = response.json()
+    except ValueError:
+        result = None
+    if isinstance(result, dict) and (
+        result.get("success") is False
+        or result.get("status") in ("error", "failed")
+        or result.get("error")
+    ):
+        raise ScanFailure("Sheets webhook reported an error")
     print(f"Sheets webhook accepted {len(sheet_rows)} rows.", flush=True)
+    return True
 
 
-def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
+def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | None]:
     started = datetime.now(SGT)
     run_dir = Path(args.output_dir) / (
         started.strftime("%Y-%m-%d_%H-%M-%S_SGT") + f"_attempt-{attempt_number}"
@@ -183,10 +265,14 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
     metadata = {
         "provider": SITE_CHECK_URL,
         "target": args.target,
+        "github_event": os.environ.get("GITHUB_EVENT_NAME"),
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
         "started_at_sgt": started.isoformat(timespec="seconds"),
         "completed_at_sgt": None,
         "scan_complete": False,
+        "quality_passed": False,
         "delivery_complete": False,
+        "status_delivered": False,
         "ocr_captcha": args.ocr_captcha,
         "scan_attempt": attempt_number,
         "captcha_attempts": 0,
@@ -197,7 +283,7 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
     browser = None
     snapshot: dict = {}
     exit_code = 1
-    retryable = False
+    retry_reason = None
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -314,14 +400,37 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
                     "provider_statistics": snapshot["statistics_text"],
                 }
             )
+            issues = report_quality_issues(
+                args.target,
+                snapshot,
+                rows,
+                min_checked=args.min_checked,
+                max_timeout_rows=args.max_timeout_rows,
+            )
+            metadata["quality_issues"] = issues
+            if issues:
+                metadata["state"] = "inconclusive"
+                save_json(run_dir / "scan_status.json", metadata)
+                if attempt_number == args.scan_attempts:
+                    metadata["status_delivered"] = send_to_sheets(
+                        args.target,
+                        snapshot,
+                        [],
+                        status="SCAN INCONCLUSIVE",
+                        note="; ".join(issues),
+                    )
+                raise InconclusiveScan("; ".join(issues))
+            metadata["quality_passed"] = True
             save_json(run_dir / "scan_status.json", metadata)
-            send_to_sheets(args.target, snapshot, rows)
-            metadata["delivery_complete"] = True
+            metadata["delivery_complete"] = send_to_sheets(args.target, snapshot, rows)
             exit_code = 0
             print(f"Complete provider report: {run_dir.resolve()}", flush=True)
     except (Exception, KeyboardInterrupt) as exc:
         metadata["error"] = f"{type(exc).__name__}: {exc}"
-        retryable = isinstance(exc, CaptchaFailure)
+        if isinstance(exc, InconclusiveScan):
+            retry_reason = "quality"
+        elif isinstance(exc, CaptchaFailure):
+            retry_reason = "captcha"
         if not metadata["scan_complete"]:
             metadata["state"] = "failed"
         print(f"ERROR: {metadata['error']}", file=sys.stderr, flush=True)
@@ -333,23 +442,32 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, bool]:
             metadata.setdefault("provider_status", snapshot.get("status_text"))
             metadata.setdefault("provider_statistics", snapshot.get("statistics_text"))
         save_json(run_dir / "scan_status.json", metadata)
-    return exit_code, retryable
+    return exit_code, retry_reason
 
 
 def run_with_retries(args: argparse.Namespace) -> int:
     for attempt_number in range(1, args.scan_attempts + 1):
-        exit_code, retryable = run(args, attempt_number)
+        exit_code, retry_reason = run(args, attempt_number)
         if exit_code == 0:
             return 0
-        if not (args.ocr_captcha and retryable and attempt_number < args.scan_attempts):
+        if not (
+            retry_reason in {"captcha", "quality"}
+            and (retry_reason != "captcha" or args.ocr_captcha)
+            and attempt_number < args.scan_attempts
+        ):
             return exit_code
+        delay = (
+            args.quality_retry_delay_seconds
+            if retry_reason == "quality"
+            else args.retry_delay_seconds
+        )
         print(
-            f"Image code failed; starting fresh provider scan "
+            f"Provider {retry_reason} check failed; starting fresh provider scan "
             f"{attempt_number + 1}/{args.scan_attempts} in "
-            f"{args.retry_delay_seconds} seconds.",
+            f"{delay} seconds.",
             flush=True,
         )
-        time.sleep(args.retry_delay_seconds)
+        time.sleep(delay)
     return 1
 
 
@@ -361,12 +479,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--captcha-attempts", type=int, default=6)
     parser.add_argument("--scan-attempts", type=int, default=3)
     parser.add_argument("--retry-delay-seconds", type=int, default=20)
+    parser.add_argument("--quality-retry-delay-seconds", type=int, default=300)
+    parser.add_argument("--min-checked", type=int, default=0)
+    parser.add_argument("--max-timeout-rows", type=int)
     parser.add_argument("--headed", action="store_true", help="Show browser during OCR mode")
     args = parser.parse_args()
     if args.captcha_attempts < 1 or args.scan_attempts < 1:
         parser.error("Attempt counts must be positive.")
-    if args.retry_delay_seconds < 0:
+    if args.retry_delay_seconds < 0 or args.quality_retry_delay_seconds < 0:
         parser.error("Retry delay cannot be negative.")
+    if args.min_checked < 0 or (
+        args.max_timeout_rows is not None and args.max_timeout_rows < 0
+    ):
+        parser.error("Report quality thresholds cannot be negative.")
     if not args.target.startswith(("https://", "http://")):
         parser.error("Target must include http:// or https://.")
     return args

@@ -38,11 +38,14 @@ jobs:
         env:
           PYTHONUNBUFFERED: '1'
           SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}
+        # Healthy provider scans checked about 1,090 URLs; reject short crawls.
         run: >-
           python provider_site_check.py
           --target https://www.emservices.com.sg/
           --output-dir reports
           --scan-attempts 3
+          --min-checked 800
+          --max-timeout-rows 10
           --ocr-captcha
 
       - name: Upload provider report and diagnostics
