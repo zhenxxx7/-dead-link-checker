@@ -239,9 +239,17 @@ def send_to_sheets(
     try:
         response = requests.post(webhook, json={"rows": sheet_rows}, timeout=30)
     except requests.RequestException as exc:
-        raise ScanFailure(f"Sheets webhook request failed: {type(exc).__name__}") from None
+        print(
+            f"Sheets webhook request failed ({type(exc).__name__}); keeping report in Action artifact only.",
+            flush=True,
+        )
+        return False
     if not response.ok:
-        raise ScanFailure(f"Sheets webhook returned HTTP {response.status_code}")
+        print(
+            f"Sheets webhook returned HTTP {response.status_code}; keeping report in Action artifact only.",
+            flush=True,
+        )
+        return False
     try:
         result = response.json()
     except ValueError:
@@ -251,7 +259,11 @@ def send_to_sheets(
         or result.get("status") in ("error", "failed")
         or result.get("error")
     ):
-        raise ScanFailure("Sheets webhook reported an error")
+        print(
+            "Sheets webhook reported an error; keeping report in Action artifact only.",
+            flush=True,
+        )
+        return False
     print(f"Sheets webhook accepted {len(sheet_rows)} rows.", flush=True)
     return True
 
