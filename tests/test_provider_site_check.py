@@ -166,23 +166,31 @@ class SpreadsheetBatchTests(unittest.TestCase):
         self.assertEqual(payload[1][1], "SCAN START (schedule)")
         self.assertEqual(payload[2][1], "SCAN COMPLETE")
 
-    def test_webhook_application_error_is_not_marked_delivered(self):
+    def test_webhook_application_error_keeps_artifact_only(self):
         snapshot = {"percent": 100, "checked": 1089, "failed": 0, "denied": 0}
         with patch.dict(checker.os.environ, {"SHEET_WEBHOOK_URL": "https://example.test/webhook"}):
             with patch("requests.post") as post:
                 post.return_value.ok = True
                 post.return_value.json.return_value = {"success": False}
-                with self.assertRaisesRegex(checker.ScanFailure, "webhook reported an error"):
-                    checker.send_to_sheets("https://example.com/", snapshot, [])
+                self.assertFalse(checker.send_to_sheets("https://example.com/", snapshot, []))
 
     def test_webhook_request_error_does_not_expose_url(self):
         snapshot = {"percent": 100, "checked": 1089, "failed": 0, "denied": 0}
         secret_url = "https://example.test/private-secret"
         with patch.dict(checker.os.environ, {"SHEET_WEBHOOK_URL": secret_url}):
             with patch("requests.post", side_effect=requests.Timeout(secret_url)):
-                with self.assertRaises(checker.ScanFailure) as caught:
-                    checker.send_to_sheets("https://example.com/", snapshot, [])
-        self.assertNotIn(secret_url, str(caught.exception))
+                with patch("builtins.print") as print_mock:
+                    self.assertFalse(checker.send_to_sheets("https://example.com/", snapshot, []))
+        logged = " ".join(" ".join(map(str, call.args)) for call in print_mock.call_args_list)
+        self.assertNotIn(secret_url, logged)
+
+    def test_webhook_http_error_keeps_artifact_only(self):
+        snapshot = {"percent": 100, "checked": 1089, "failed": 0, "denied": 0}
+        with patch.dict(checker.os.environ, {"SHEET_WEBHOOK_URL": "https://example.test/webhook"}):
+            with patch("requests.post") as post:
+                post.return_value.ok = False
+                post.return_value.status_code = 404
+                self.assertFalse(checker.send_to_sheets("https://example.com/", snapshot, []))
 
 
 class ScanRetryTests(unittest.TestCase):
