@@ -18,6 +18,7 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -27,6 +28,17 @@ DEFAULT_TARGET = "https://www.emservices.com.sg/"
 SGT = timezone(timedelta(hours=8), "SGT")
 POLL_SECONDS = 2
 CAPTCHA_RESPONSE_SECONDS = 30
+COMMON_TLD_SUFFIXES = (
+    ".com.sg",
+    ".org.sg",
+    ".net.sg",
+    ".gov.sg",
+    ".edu.sg",
+    ".com",
+    ".org",
+    ".net",
+    ".sg",
+)
 
 
 class ScanFailure(RuntimeError):
@@ -41,8 +53,23 @@ class InconclusiveScan(ScanFailure):
     """The provider finished, but the crawl is unreliable as a client report."""
 
 
+class TransientProviderFailure(ScanFailure):
+    """The provider interrupted a scan transiently (e.g. canceled or concurrent)."""
+
+
 def now_sgt() -> str:
     return datetime.now(SGT).isoformat(timespec="seconds")
+
+
+def default_sheet_name(target: str) -> str:
+    """Derive a clean Excel / Google Sheets tab name from a target URL."""
+    host = (urlsplit(target).hostname or "").lower().removeprefix("www.")
+    for suffix in COMMON_TLD_SUFFIXES:
+        if host.endswith(suffix) and len(host) > len(suffix):
+            host = host[: -len(suffix)]
+            break
+    sanitized = re.sub(r"[\\/?*\[\]:]+", "_", host).strip("._ ")
+    return (sanitized or "site")[:31]
 
 
 def browser_snapshot(page) -> dict:
@@ -95,34 +122,64 @@ def classify_snapshot(snapshot: dict) -> str:
     return "pending"
 
 
+def preprocess_captcha_variants(image_bytes: bytes) -> list:
+    """Normalize shaded and colored CAPTCHAs into crisp black-on-white views."""
+    from PIL import Image, ImageChops, ImageFilter, ImageOps
+
+    rgb = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    gray = rgb.convert("L")
+    r, g, b = rgb.split()
+    min_rgb = ImageChops.darker(ImageChops.darker(r, g), b)
+
+    variants = []
+    for channel in (gray, min_rgb):
+        # Estimate local background brightness so shaded gradients flatten cleanly
+        # while medium-gray and colored letters remain dark.
+        bg = channel.filter(ImageFilter.MaxFilter(size=15))
+        flat_bytes = bytes(
+            255 if bv == 0 else min(255, (cv * 255) // bv)
+            for cv, bv in zip(channel.tobytes(), bg.tobytes())
+        )
+        flat = Image.frombytes("L", channel.size, flat_bytes)
+        enlarged = flat.resize(
+            (flat.width * 4, flat.height * 4), Image.Resampling.LANCZOS
+        )
+        # Generous white padding prevents edge-touching letters from being clipped.
+        padded = ImageOps.expand(enlarged, border=40, fill=255)
+        smooth = padded.filter(ImageFilter.MedianFilter(size=3))
+        variants.extend(
+            (
+                ImageOps.autocontrast(padded),
+                smooth.point(lambda pixel: 255 if pixel > 175 else 0),
+                smooth.point(lambda pixel: 255 if pixel > 195 else 0),
+                smooth.point(lambda pixel: 255 if pixel > 210 else 0),
+            )
+        )
+    return variants
+
+
 def captcha_code(image_bytes: bytes) -> str:
     """Read the displayed code with several local image treatments."""
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
     import pytesseract
 
-    original = Image.open(io.BytesIO(image_bytes)).convert("L")
-    enlarged = ImageOps.autocontrast(original).resize(
-        (original.width * 4, original.height * 4), Image.Resampling.LANCZOS
-    )
-    boosted = ImageEnhance.Contrast(enlarged).enhance(2.5)
-    variants = (
-        enlarged,
-        boosted,
-        boosted.filter(ImageFilter.MedianFilter(size=3)),
-        boosted.point(lambda pixel: 255 if pixel > 135 else 0),
-        boosted.point(lambda pixel: 255 if pixel > 170 else 0),
-    )
-    votes: Counter[str] = Counter()
-    config = (
-        "--oem 3 -c tessedit_char_whitelist="
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    )
-    for variant in variants:
-        for psm in (7, 8, 13):
-            raw = pytesseract.image_to_string(variant, config=f"{config} --psm {psm}")
-            candidate = re.sub(r"[^A-Z0-9]", "", raw.upper())
-            if 3 <= len(candidate) <= 8:
-                votes[candidate] += 1
+    variants = preprocess_captcha_variants(image_bytes)
+
+    def vote(whitelist: str, pattern: str) -> Counter[str]:
+        votes: Counter[str] = Counter()
+        config = f"--oem 3 -c tessedit_char_whitelist={whitelist}"
+        for variant in variants:
+            for psm in (7, 8, 13):
+                raw = pytesseract.image_to_string(variant, config=f"{config} --psm {psm}")
+                candidate = re.sub(pattern, "", raw.upper())
+                if 3 <= len(candidate) <= 6:
+                    votes[candidate] += 1
+        return votes
+
+    # Dead Link Checker codes are 3-5 uppercase A-Z letters; restricting to A-Z
+    # avoids S/5, B/8, G/6, Z/2 confusions, with an alphanumeric fallback.
+    votes = vote("ABCDEFGHIJKLMNOPQRSTUVWXYZ", r"[^A-Z]")
+    if not votes:
+        votes = vote("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", r"[^A-Z0-9]")
     if not votes:
         raise CaptchaFailure("OCR could not read the provider's image code.")
     return votes.most_common(1)[0][0]
@@ -218,6 +275,7 @@ def send_to_sheets(
     *,
     status: str = "SCAN COMPLETE",
     note: str = "",
+    sheet_name: str | None = None,
 ) -> bool:
     webhook = os.environ.get("SHEET_WEBHOOK_URL")
     if not webhook:
@@ -225,6 +283,7 @@ def send_to_sheets(
         return False
     import requests
 
+    resolved_sheet = (sheet_name or default_sheet_name(target)).strip()
     sheet_rows = spreadsheet_batch(
         target,
         snapshot,
@@ -236,8 +295,13 @@ def send_to_sheets(
         status=status,
         note=note,
     )
+    payload = {
+        "sheet": resolved_sheet,
+        "target": target,
+        "rows": sheet_rows,
+    }
     try:
-        response = requests.post(webhook, json={"rows": sheet_rows}, timeout=30)
+        response = requests.post(webhook, json=payload, timeout=30)
     except requests.RequestException as exc:
         raise ScanFailure(f"Sheets webhook request failed: {type(exc).__name__}") from None
     if not response.ok:
@@ -252,12 +316,144 @@ def send_to_sheets(
         or result.get("error")
     ):
         raise ScanFailure("Sheets webhook reported an error")
-    print(f"Sheets webhook accepted {len(sheet_rows)} rows.", flush=True)
+    if isinstance(result, dict) and result.get("sheet") and result.get("sheet") != resolved_sheet:
+        print(
+            f"Warning: Sheets webhook wrote to '{result.get('sheet')}' "
+            f"instead of requested sheet '{resolved_sheet}'.",
+            flush=True,
+        )
+    elif not (isinstance(result, dict) and result.get("sheet")):
+        print(
+            f"Note: Sheets webhook did not report a sheet name; ensure "
+            f"apps_script/Code.gs is deployed so rows route to '{resolved_sheet}'.",
+            flush=True,
+        )
+    print(
+        f"Sheets webhook accepted {len(sheet_rows)} rows for sheet '{resolved_sheet}'.",
+        flush=True,
+    )
     return True
+
+
+def wait_for_scan_completion(
+    page,
+    args: argparse.Namespace,
+    run_dir: Path,
+    metadata: dict,
+    submitted_sources: set[str],
+) -> dict:
+    """Poll the provider page until the active scan/retry pass completes."""
+    last_progress_log = 0.0
+    last_submission = 0.0
+    last_manual_prompt = ""
+    consecutive_captcha_attempts = 0
+    max_total_captcha_attempts = max(args.captcha_attempts * 4, 24)
+
+    while True:
+        if page.is_closed():
+            raise ScanFailure("Provider browser page closed before scan completed.")
+        snapshot = browser_snapshot(page)
+        classification = classify_snapshot(snapshot)
+        if classification == "complete":
+            scanned = snapshot.get("scanned_url", "").rstrip("/")
+            if scanned.lower() != args.target.rstrip("/").lower():
+                raise ScanFailure(f"Provider scanned unexpected URL: {scanned!r}")
+            return snapshot
+        if classification in {"canceled", "concurrent_scan"}:
+            raise TransientProviderFailure(f"Provider scan ended: {classification}.")
+        if classification != "pending":
+            raise ScanFailure(f"Provider scan ended: {classification}.")
+        if snapshot["current_page"].split("?")[0] != SITE_CHECK_URL:
+            raise ScanFailure("Provider left the Site Check page before completion.")
+
+        if snapshot["captcha_visible"]:
+            src = snapshot["captcha_src"]
+            if args.ocr_captcha and "sec.asp" in src:
+                if src not in submitted_sources:
+                    if consecutive_captcha_attempts >= args.captcha_attempts:
+                        raise CaptchaFailure(
+                            f"Image code rejected after {args.captcha_attempts} consecutive attempts."
+                        )
+                    if metadata["captcha_attempts"] >= max_total_captcha_attempts:
+                        raise CaptchaFailure(
+                            f"Image code exceeded {max_total_captcha_attempts} total attempts."
+                        )
+                    consecutive_captcha_attempts += 1
+                    metadata["captcha_attempts"] += 1
+                    try:
+                        page.wait_for_function(
+                            "() => { const image = document.querySelector('#captcha'); "
+                            "return image && image.src.includes('/sec.asp') "
+                            "&& image.complete && image.naturalWidth > 0; }",
+                            timeout=15000,
+                        )
+                    except PlaywrightTimeoutError as exc:
+                        raise CaptchaFailure("Provider image code did not load.") from exc
+                    png = page.locator("#captcha").screenshot()
+                    (run_dir / f"captcha-{metadata['captcha_attempts']}.png").write_bytes(png)
+                    code = captcha_code(png)
+                    print(
+                        f"Image code attempt {metadata['captcha_attempts']} "
+                        f"(challenge try {consecutive_captcha_attempts}/{args.captcha_attempts}): "
+                        f"OCR read {len(code)} characters.",
+                        flush=True,
+                    )
+                    field = page.locator("#captchatxt")
+                    field.fill("")
+                    field.press_sequentially(code, delay=50)
+                    page.locator("#btn0").click(timeout=10000)
+                    submitted_sources.add(src)
+                    last_submission = time.monotonic()
+                elif time.monotonic() - last_submission > CAPTCHA_RESPONSE_SECONDS:
+                    raise CaptchaFailure("Provider did not advance after image code entry.")
+            elif not args.ocr_captcha and src != last_manual_prompt:
+                print(
+                    "Enter the displayed image code in the browser, then click "
+                    "check or resume. This may recur during the scan.",
+                    flush=True,
+                )
+                last_manual_prompt = src
+        else:
+            # Captcha passed and scanning resumed; reset per-challenge counter.
+            consecutive_captcha_attempts = 0
+
+        now = time.monotonic()
+        if now - last_progress_log >= 30:
+            print(
+                f"Provider progress: {snapshot['percent']}% scanned, "
+                f"{snapshot['checked']} checked; "
+                f"{snapshot['statistics_text'][:160]}",
+                flush=True,
+            )
+            last_progress_log = now
+        page.wait_for_timeout(POLL_SECONDS * 1000)
+
+
+def try_click_retry_dead_links(page) -> bool:
+    """Click Dead Link Checker's built-in 'Retry dead links' button if visible."""
+    retry_btn = page.locator("button", has_text="Retry dead links")
+    if retry_btn.count() == 0 or not retry_btn.first.is_visible():
+        return False
+    retry_btn.first.click(timeout=10000)
+    try:
+        page.wait_for_function(
+            """() => {
+                const cap = document.querySelector('#capdiv');
+                const capVisible = !!(cap && cap.getClientRects().length);
+                return capVisible || (typeof sitestate !== 'undefined' && sitestate !== 3);
+            }""",
+            timeout=15000,
+        )
+        return True
+    except PlaywrightTimeoutError:
+        return False
 
 
 def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | None]:
     started = datetime.now(SGT)
+    sheet_name = (getattr(args, "sheet_name", None) or default_sheet_name(args.target)).strip()
+    dead_link_retries = getattr(args, "dead_link_retries", 2)
+    dead_link_retry_delay = getattr(args, "dead_link_retry_delay_seconds", 45)
     run_dir = Path(args.output_dir) / (
         started.strftime("%Y-%m-%d_%H-%M-%S_SGT") + f"_attempt-{attempt_number}"
     )
@@ -265,6 +461,7 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
     metadata = {
         "provider": SITE_CHECK_URL,
         "target": args.target,
+        "sheet_name": sheet_name,
         "github_event": os.environ.get("GITHUB_EVENT_NAME"),
         "github_run_id": os.environ.get("GITHUB_RUN_ID"),
         "started_at_sgt": started.isoformat(timespec="seconds"),
@@ -276,6 +473,7 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
         "ocr_captcha": args.ocr_captcha,
         "scan_attempt": attempt_number,
         "captcha_attempts": 0,
+        "dead_link_retries": 0,
         "state": "starting",
         "error": None,
     }
@@ -303,87 +501,52 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
                 timeout=15000,
             )
             page.locator("#btn0").click()
-            print(f"Provider scan requested for {args.target}", flush=True)
+            print(f"Provider scan requested for {args.target} (sheet: {sheet_name})", flush=True)
             metadata["state"] = "scanning"
 
-            last_progress_log = 0.0
             submitted_sources: set[str] = set()
-            last_submission = 0.0
-            last_manual_prompt = ""
-            while True:
-                if page.is_closed():
-                    raise ScanFailure("Provider browser page closed before scan completed.")
-                snapshot = browser_snapshot(page)
-                classification = classify_snapshot(snapshot)
-                if classification == "complete":
-                    scanned = snapshot.get("scanned_url", "").rstrip("/")
-                    if scanned.lower() != args.target.rstrip("/").lower():
-                        raise ScanFailure(f"Provider scanned unexpected URL: {scanned!r}")
-                    metadata["scan_complete"] = True
-                    metadata["state"] = "complete"
+            snapshot = wait_for_scan_completion(page, args, run_dir, metadata, submitted_sources)
+            rows = result_rows(page)
+            issues = report_quality_issues(
+                args.target,
+                snapshot,
+                rows,
+                min_checked=args.min_checked,
+                max_timeout_rows=args.max_timeout_rows,
+            )
+
+            # In-place recovery: use the provider's own 'Retry dead links' button
+            # to re-check timed-out pages and continue crawling without restarting at 0.
+            while issues and metadata["dead_link_retries"] < dead_link_retries:
+                next_retry = metadata["dead_link_retries"] + 1
+                print(
+                    f"Provider report inconclusive ({'; '.join(issues)}); "
+                    f"pausing {dead_link_retry_delay}s before 'Retry dead links' "
+                    f"({next_retry}/{dead_link_retries}).",
+                    flush=True,
+                )
+                if dead_link_retry_delay > 0:
+                    time.sleep(dead_link_retry_delay)
+                if not try_click_retry_dead_links(page):
+                    print("Provider 'Retry dead links' button unavailable; keeping current scan.", flush=True)
                     break
-                if classification != "pending":
-                    raise ScanFailure(f"Provider scan ended: {classification}.")
-                if snapshot["current_page"].split("?")[0] != SITE_CHECK_URL:
-                    raise ScanFailure("Provider left the Site Check page before completion.")
+                metadata["dead_link_retries"] = next_retry
+                snapshot = wait_for_scan_completion(page, args, run_dir, metadata, submitted_sources)
+                rows = result_rows(page)
+                issues = report_quality_issues(
+                    args.target,
+                    snapshot,
+                    rows,
+                    min_checked=args.min_checked,
+                    max_timeout_rows=args.max_timeout_rows,
+                )
 
-                if snapshot["captcha_visible"]:
-                    src = snapshot["captcha_src"]
-                    if args.ocr_captcha and "sec.asp" in src:
-                        if src not in submitted_sources:
-                            if metadata["captcha_attempts"] >= args.captcha_attempts:
-                                raise CaptchaFailure(
-                                    f"Image code rejected after {args.captcha_attempts} attempts."
-                                )
-                            metadata["captcha_attempts"] += 1
-                            try:
-                                page.wait_for_function(
-                                    "() => { const image = document.querySelector('#captcha'); "
-                                    "return image && image.src.includes('/sec.asp') "
-                                    "&& image.complete && image.naturalWidth > 0; }",
-                                    timeout=15000,
-                                )
-                            except PlaywrightTimeoutError as exc:
-                                raise CaptchaFailure("Provider image code did not load.") from exc
-                            png = page.locator("#captcha").screenshot()
-                            (run_dir / f"captcha-{metadata['captcha_attempts']}.png").write_bytes(png)
-                            code = captcha_code(png)
-                            print(
-                                f"Image code attempt {metadata['captcha_attempts']}: "
-                                f"OCR read {len(code)} characters.",
-                                flush=True,
-                            )
-                            field = page.locator("#captchatxt")
-                            field.fill("")
-                            field.press_sequentially(code, delay=50)
-                            page.locator("#btn0").click(timeout=10000)
-                            submitted_sources.add(src)
-                            last_submission = time.monotonic()
-                        elif time.monotonic() - last_submission > CAPTCHA_RESPONSE_SECONDS:
-                            raise CaptchaFailure("Provider did not advance after image code entry.")
-                    elif not args.ocr_captcha and src != last_manual_prompt:
-                        print(
-                            "Enter the displayed image code in the browser, then click "
-                            "check or resume. This may recur during the scan.",
-                            flush=True,
-                        )
-                        last_manual_prompt = src
-
-                now = time.monotonic()
-                if now - last_progress_log >= 30:
-                    print(
-                        f"Provider progress: {snapshot['percent']}% scanned, "
-                        f"{snapshot['checked']} checked; "
-                        f"{snapshot['statistics_text'][:160]}",
-                        flush=True,
-                    )
-                    last_progress_log = now
-                page.wait_for_timeout(POLL_SECONDS * 1000)
+            metadata["scan_complete"] = True
+            metadata["state"] = "complete"
             report_html = page.evaluate("reporttext")
             if "DeadLinkChecker.com - report" not in report_html:
                 raise ScanFailure("Provider did not generate its full report.")
             (run_dir / "provider-report.html").write_text(report_html, encoding="utf-8")
-            rows = result_rows(page)
             with (run_dir / "provider-results.csv").open("w", newline="", encoding="utf-8-sig") as out:
                 writer = csv.writer(out)
                 writer.writerow(["Status", "URL", "Source link text"])
@@ -400,13 +563,6 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
                     "provider_statistics": snapshot["statistics_text"],
                 }
             )
-            issues = report_quality_issues(
-                args.target,
-                snapshot,
-                rows,
-                min_checked=args.min_checked,
-                max_timeout_rows=args.max_timeout_rows,
-            )
             metadata["quality_issues"] = issues
             if issues:
                 metadata["state"] = "inconclusive"
@@ -418,11 +574,14 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
                         [],
                         status="SCAN INCONCLUSIVE",
                         note="; ".join(issues),
+                        sheet_name=sheet_name,
                     )
                 raise InconclusiveScan("; ".join(issues))
             metadata["quality_passed"] = True
             save_json(run_dir / "scan_status.json", metadata)
-            metadata["delivery_complete"] = send_to_sheets(args.target, snapshot, rows)
+            metadata["delivery_complete"] = send_to_sheets(
+                args.target, snapshot, rows, sheet_name=sheet_name
+            )
             exit_code = 0
             print(f"Complete provider report: {run_dir.resolve()}", flush=True)
     except (Exception, KeyboardInterrupt) as exc:
@@ -431,8 +590,11 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
             retry_reason = "quality"
         elif isinstance(exc, CaptchaFailure):
             retry_reason = "captcha"
+        elif isinstance(exc, TransientProviderFailure):
+            retry_reason = "provider"
         if not metadata["scan_complete"]:
             metadata["state"] = "failed"
+            save_browser_evidence(page, run_dir, completed=False)
         print(f"ERROR: {metadata['error']}", file=sys.stderr, flush=True)
     finally:
         metadata["completed_at_sgt"] = metadata["completed_at_sgt"] or now_sgt()
@@ -451,7 +613,7 @@ def run_with_retries(args: argparse.Namespace) -> int:
         if exit_code == 0:
             return 0
         if not (
-            retry_reason in {"captcha", "quality"}
+            retry_reason in {"captcha", "quality", "provider"}
             and (retry_reason != "captcha" or args.ocr_captcha)
             and attempt_number < args.scan_attempts
         ):
@@ -471,29 +633,39 @@ def run_with_retries(args: argparse.Namespace) -> int:
     return 1
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", default=DEFAULT_TARGET)
+    parser.add_argument("--sheet-name", help="Target Google Sheet / Excel tab name (defaults to domain slug)")
     parser.add_argument("--output-dir", default="reports")
     parser.add_argument("--ocr-captcha", action="store_true")
-    parser.add_argument("--captcha-attempts", type=int, default=6)
+    parser.add_argument("--captcha-attempts", type=int, default=8)
     parser.add_argument("--scan-attempts", type=int, default=3)
     parser.add_argument("--retry-delay-seconds", type=int, default=20)
     parser.add_argument("--quality-retry-delay-seconds", type=int, default=300)
+    parser.add_argument("--dead-link-retries", type=int, default=2)
+    parser.add_argument("--dead-link-retry-delay-seconds", type=int, default=45)
     parser.add_argument("--min-checked", type=int, default=0)
     parser.add_argument("--max-timeout-rows", type=int)
     parser.add_argument("--headed", action="store_true", help="Show browser during OCR mode")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.captcha_attempts < 1 or args.scan_attempts < 1:
         parser.error("Attempt counts must be positive.")
-    if args.retry_delay_seconds < 0 or args.quality_retry_delay_seconds < 0:
-        parser.error("Retry delay cannot be negative.")
+    if (
+        args.retry_delay_seconds < 0
+        or args.quality_retry_delay_seconds < 0
+        or args.dead_link_retries < 0
+        or args.dead_link_retry_delay_seconds < 0
+    ):
+        parser.error("Retry counts and delays cannot be negative.")
     if args.min_checked < 0 or (
         args.max_timeout_rows is not None and args.max_timeout_rows < 0
     ):
         parser.error("Report quality thresholds cannot be negative.")
     if not args.target.startswith(("https://", "http://")):
         parser.error("Target must include http:// or https://.")
+    if not args.sheet_name:
+        args.sheet_name = default_sheet_name(args.target)
     return args
 
 

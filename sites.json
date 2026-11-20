@@ -1,0 +1,30 @@
+[
+  {
+    "name": "emservices",
+    "sheet": "emservices",
+    "target": "https://www.emservices.com.sg/",
+    "min_checked": 800,
+    "max_timeout_rows": 10
+  },
+  {
+    "name": "commercial.yoha",
+    "sheet": "commercial.yoha",
+    "target": "https://www.commercial.yoha.com.sg/",
+    "min_checked": 200,
+    "max_timeout_rows": 10
+  },
+  {
+    "name": "emengineering",
+    "sheet": "emengineering",
+    "target": "https://www.emengineering.com.sg/",
+    "min_checked": 150,
+    "max_timeout_rows": 10
+  },
+  {
+    "name": "emre",
+    "sheet": "emre",
+    "target": "https://www.emre.com.sg/",
+    "min_checked": 150,
+    "max_timeout_rows": 10
+  }
+]

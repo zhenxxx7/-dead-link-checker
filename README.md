@@ -1,23 +1,45 @@
 # Dead Link Checker Site Check
 
-`provider_site_check.py` uses the free [Dead Link Checker Site Check](https://www.deadlinkchecker.com/website-dead-link-checker.asp) to check `https://www.emservices.com.sg/`. It does not crawl the target site itself. The old direct crawler, `dlc_sheets.py`, remains in the repository for reference but is not part of the scheduled client check.
+`provider_site_check.py` uses the free [Dead Link Checker Site Check](https://www.deadlinkchecker.com/website-dead-link-checker.asp) to check every website configured in [`sites.json`](sites.json). It does not crawl the target sites itself. The old direct crawler, `dlc_sheets.py`, remains in the repository for reference but is not part of the scheduled client check.
+
+## Monitored Websites
+
+Each website is checked in its own separate job and reported to its own dedicated sheet (1 sheet = 1 website):
+
+| Sheet / Site Key | Target URL | Min Checked URLs | Max Timeout Rows |
+| --- | --- | ---: | ---: |
+| `emservices` | `https://www.emservices.com.sg/` | 800 | 10 |
+| `commercial.yoha` | `https://www.commercial.yoha.com.sg/` | 200 | 10 |
+| `emengineering` | `https://www.emengineering.com.sg/` | 150 | 10 |
+| `emre` | `https://www.emre.com.sg/` | 150 | 10 |
 
 ## GitHub Action
 
-[Provider Site Check](.github/workflows/provider_site_check.yml) starts daily at **06:00, 13:00, and 19:00 Singapore time / WITA** (UTC+8). The corresponding UTC schedule is 22:00 on the previous day, 05:00, and 11:00. You can also start it with **Actions → Provider Site Check → Run workflow**. It opens the provider's page, uses best-effort OCR for the site's image code, and saves its result or diagnostic files under the run's `provider-site-check-*` artifact. When `SHEET_WEBHOOK_URL` is configured, completed results can also be sent to the Sheets webhook.
+[Provider Site Check](.github/workflows/provider_site_check.yml) starts daily at **06:00, 13:00, and 19:00 Singapore time / WITA** (UTC+8). The corresponding UTC schedule is 22:00 on the previous day, 05:00, and 11:00. You can also start it manually with **Actions → Provider Site Check → Run workflow**, choosing either `all` or a single website.
 
-A successful Action means the provider reported **100% complete** and passed a report quality check. A scheduled run on 2 October 2026 found only 302 URLs and 64 timeouts, while two manual runs found about 1,090 URLs and 3–5 errors. The workflow now requires at least 800 checked URLs, at most 10 timeout rows, and no timeout on the target homepage. An inconclusive report is kept in the Action artifact and retried with a fresh provider scan, up to three total attempts. Only a passing report sends its link rows to Sheets. If all attempts are inconclusive, Sheets receives one **SCAN INCONCLUSIVE** summary without the suspect link rows, and the Action fails. OCR failures also retry. The script has no whole-scan time limit: it waits for the provider to finish. GitHub-hosted jobs still have a [six-hour maximum](https://docs.github.com/en/actions/reference/limits). The provider sets its own per-link timeouts; removing the script limit cannot change those `-1 Timeout` results. GitHub scheduled runs may start late. Reports are produced **after** a scan finishes, not at the scheduled start time.
+- **Separate job per site, sequential execution (`max-parallel: 1`, `fail-fast: false`)**: all four sites share the same origin servers, so running one site at a time prevents timeout storms while ensuring one site's failure never blocks the others.
+- **Improved CAPTCHA OCR & per-challenge retry budget**: background-flattened grayscale + min-RGB preprocessing with white border padding and per-challenge consecutive retry limits so mid-scan CAPTCHAs do not abort healthy scans.
+- **In-place timeout recovery (`--dead-link-retries 2`)**: if a 100% provider scan finishes with signs of a truncated crawl (too few checked URLs, too many timeouts, or homepage timeout), the script pauses briefly and clicks the provider's own **Retry dead links** button to re-check timed-out pages and continue crawling without starting over from zero. If still inconclusive, it falls back to fresh provider scans (up to 3 total attempts).
+- **Combined Excel workbook (`.xlsx`)**: after all site jobs finish, `build_excel_report.py` combines all results into a formatted multi-sheet Excel artifact (`dead-link-report-<run_id>.xlsx`) containing a `Summary` tab plus one dedicated tab per website.
 
-Each Sheets delivery starts with a blank separator and a `SCAN START` row showing whether GitHub started the run on a schedule or manually, plus a link to that run. Existing sheet rows remain as history; new scan blocks are separated. The 800-URL threshold is specific to the current site and should be reviewed if its size changes substantially.
+## Google Sheets Setup (1 Sheet per Website)
 
-## Manual fallback
+`Sheet1` is preserved untouched as historical archive. New reports route to dedicated tabs (`emservices`, `commercial.yoha`, `emengineering`, `emre`), summarized automatically on the `Summary` tab.
 
-Run on a computer with a desktop browser. Complete the image code yourself in the browser that opens:
+To route webhook payloads from `SHEET_WEBHOOK_URL` to each website's own tab:
+1. Open the Google Sheet → **Extensions → Apps Script**.
+2. Replace `Code.gs` with [`apps_script/Code.gs`](apps_script/Code.gs) and save.
+3. Click **Deploy → Manage deployments → Edit (pencil icon) → Version: New version → Deploy** (this keeps the exact same `SHEET_WEBHOOK_URL`).
+
+## Manual Fallback
+
+Run on a computer with a desktop browser and complete the image code yourself:
 
 ```powershell
 py -m pip install -r requirements.txt
 py -m playwright install chromium
-py provider_site_check.py --target https://www.emservices.com.sg/ --output-dir reports --min-checked 800 --max-timeout-rows 10
+py provider_site_check.py --target https://www.emservices.com.sg/ --sheet-name emservices --output-dir reports/emservices --min-checked 800 --max-timeout-rows 10
+py build_excel_report.py --sites sites.json --reports-dir reports --output dead-link-report.xlsx
 ```
 
 Wait for the provider's scan to reach 100%. Save the completed report for the client; an incomplete or failed scan is not a report.
