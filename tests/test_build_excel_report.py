@@ -185,6 +185,26 @@ class BuildExcelReportTests(unittest.TestCase):
                     for cell in row:
                         self.assertNotIn("github.com", str(cell or "").lower())
 
+    def test_single_site_cli_filter_writes_summary_and_one_sheet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sites_file = Path(tmp) / "sites.json"
+            sites_file.write_text(
+                json.dumps(
+                    [
+                        {"name": "emservices", "sheet": "emservices", "target": "https://www.emservices.com.sg/"},
+                        {"name": "emre", "sheet": "emre", "target": "https://www.emre.com.sg/"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            out_path = Path(tmp) / "single.xlsx"
+            rc = report_builder.main(
+                ["--sites", str(sites_file), "--site", "emre", "--reports-dir", tmp, "--output", str(out_path)]
+            )
+            self.assertEqual(rc, 0)
+            wb = load_workbook(out_path)
+            self.assertEqual(wb.sheetnames, ["Summary", "emre"])
+
 
 if __name__ == "__main__":
     unittest.main()

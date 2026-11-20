@@ -13,14 +13,20 @@ Each website is checked in its own separate job and reported to its own dedicate
 | `emengineering` | `https://www.emengineering.com.sg/` | 150 | 10 |
 | `emre` | `https://www.emre.com.sg/` | 150 | 10 |
 
-## GitHub Action
+## GitHub Actions (Separate & Parallel Workflows)
 
-[Provider Site Check](.github/workflows/provider_site_check.yml) starts daily at **06:00, 13:00, and 19:00 Singapore time / WITA** (UTC+8). The corresponding UTC schedule is 22:00 on the previous day, 05:00, and 11:00. You can also start it manually with **Actions → Provider Site Check → Run workflow**, choosing either `all` or a single website.
+Each website has its own independent workflow running simultaneously at **06:00, 13:00, and 19:00 Singapore time / WITA** (UTC+8 — `22:00`, `05:00`, `11:00` UTC), and can also be triggered individually anytime:
 
-- **Separate job per site, sequential execution (`max-parallel: 1`, `fail-fast: false`)**: all four sites share the same origin servers, so running one site at a time prevents timeout storms while ensuring one site's failure never blocks the others.
+- [`Check — emservices`](.github/workflows/check_emservices.yml)
+- [`Check — commercial.yoha`](.github/workflows/check_commercial_yoha.yml)
+- [`Check — emengineering`](.github/workflows/check_emengineering.yml)
+- [`Check — emre`](.github/workflows/check_emre.yml)
+- [`Provider Site Check (All Sites — Manual Parallel)`](.github/workflows/provider_site_check.yml) — manual trigger to run all 4 sites in parallel and download a single combined multi-sheet Excel workbook (`dead-link-report-<run_id>.xlsx`).
+
+- **Parallel & independent execution**: all four websites run concurrently in separate workflows so one slow or failing website never delays or fails the other three.
 - **Improved CAPTCHA OCR & per-challenge retry budget**: background-flattened grayscale + min-RGB preprocessing with white border padding and per-challenge consecutive retry limits so mid-scan CAPTCHAs do not abort healthy scans.
 - **In-place timeout recovery (`--dead-link-retries 4`, 300s cooldown)**: if a 100% provider scan finishes with signs of a truncated crawl (too few checked URLs, too many timeouts, or homepage timeout), the script pauses 5 minutes for origin rate limits to cool down and clicks the provider's own **Retry dead links** button to re-check timed-out pages and continue crawling incrementally without starting over from zero (stopping early if a retry makes no progress). If still inconclusive, it falls back to fresh provider scans (up to 3 total attempts).
-- **Combined Excel workbook (`.xlsx`)**: after all site jobs finish, `build_excel_report.py` combines all results into a formatted multi-sheet Excel artifact (`dead-link-report-<run_id>.xlsx`) containing a `Summary` tab plus one dedicated tab per website.
+- **Excel reports (`.xlsx`)**: every workflow run also produces a formatted `.xlsx` workbook via `build_excel_report.py` (with `Summary` + dedicated site sheet(s), free of GitHub Actions links).
 
 ## Google Sheets Setup (1 Sheet per Website)
 

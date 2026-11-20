@@ -1,0 +1,31 @@
+name: Check — emre
+
+on:
+  schedule:
+    # 06:00, 13:00, and 19:00 Singapore time / WITA (UTC+8).
+    - cron: '0 22 * * *'
+    - cron: '0 5 * * *'
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: check-emre
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: ./.github/workflows/_site_check.yml
+    with:
+      site_name: emre
+      target: https://www.emre.com.sg/
+      sheet_name: emre
+      min_checked: 150
+      max_timeout_rows: 10
+      scan_attempts: 3
+      dead_link_retries: 4
+      dead_link_retry_delay_seconds: 300
+    secrets:
+      SHEET_WEBHOOK_URL: ${{ secrets.SHEET_WEBHOOK_URL }}

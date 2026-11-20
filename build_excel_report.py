@@ -392,6 +392,7 @@ def populate_site_sheet(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sites", default="sites.json", type=Path)
+    parser.add_argument("--site", help="Optional single site name from sites.json to include")
     parser.add_argument("--reports-dir", default="reports", type=Path)
     parser.add_argument("--output", default="dead-link-report.xlsx", type=Path)
     return parser.parse_args(argv)
@@ -400,6 +401,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     sites = load_sites(args.sites)
+    if args.site:
+        sites = [s for s in sites if s["name"] == args.site]
+        if not sites:
+            raise ValueError(f"Unknown site name: {args.site!r}")
     out = build_workbook(sites, args.reports_dir, args.output)
     print(f"Wrote Excel report: {out.resolve()}", flush=True)
     return 0
