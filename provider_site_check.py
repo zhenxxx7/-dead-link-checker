@@ -296,11 +296,20 @@ def send_to_sheets(
         "target": target,
         "rows": sheet_rows,
     }
-    try:
-        response = requests.post(webhook, json=payload, timeout=30)
-    except requests.RequestException as exc:
-        raise ScanFailure(f"Sheets webhook request failed: {type(exc).__name__}") from None
-    if not response.ok:
+    response = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(webhook, json=payload, timeout=45)
+        except requests.RequestException as exc:
+            if attempt < 3:
+                time.sleep(5 * attempt)
+                continue
+            raise ScanFailure(f"Sheets webhook request failed: {type(exc).__name__}") from None
+        if response.ok:
+            break
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(5 * attempt)
+            continue
         raise ScanFailure(f"Sheets webhook returned HTTP {response.status_code}")
     try:
         result = response.json()

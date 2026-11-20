@@ -479,9 +479,24 @@ class SpreadsheetBatchTests(unittest.TestCase):
         secret_url = "https://example.test/private-secret"
         with patch.dict(checker.os.environ, {"SHEET_WEBHOOK_URL": secret_url}):
             with patch("requests.post", side_effect=requests.Timeout(secret_url)):
-                with self.assertRaises(checker.ScanFailure) as caught:
-                    checker.send_to_sheets("https://example.com/", snapshot, [])
+                with patch.object(checker.time, "sleep"):
+                    with self.assertRaises(checker.ScanFailure) as caught:
+                        checker.send_to_sheets("https://example.com/", snapshot, [])
         self.assertNotIn(secret_url, str(caught.exception))
+
+    def test_webhook_retries_transient_503_then_succeeds(self):
+        snapshot = {"percent": 100, "checked": 221, "failed": 2, "denied": 0}
+        err_resp = MagicMock(ok=False, status_code=503)
+        ok_resp = MagicMock(ok=True, status_code=200)
+        ok_resp.json.return_value = {"success": True, "sheet": "emre"}
+        with patch.dict(checker.os.environ, {"SHEET_WEBHOOK_URL": "https://example.test/webhook"}):
+            with patch("requests.post", side_effect=[err_resp, ok_resp]) as post:
+                with patch.object(checker.time, "sleep") as sleep:
+                    self.assertTrue(
+                        checker.send_to_sheets("https://www.emre.com.sg/", snapshot, [], sheet_name="emre")
+                    )
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(5)
 
 
 class ScanRetryTests(unittest.TestCase):
