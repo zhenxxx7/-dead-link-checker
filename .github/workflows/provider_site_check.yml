@@ -91,8 +91,8 @@ jobs:
           --sheet-name "${{ matrix.sheet }}"
           --output-dir "reports/${{ matrix.name }}"
           --scan-attempts 3
-          --dead-link-retries 2
-          --dead-link-retry-delay-seconds 45
+          --dead-link-retries 4
+          --dead-link-retry-delay-seconds 300
           --min-checked "${{ matrix.min_checked }}"
           --max-timeout-rows "${{ matrix.max_timeout_rows }}"
           --ocr-captcha

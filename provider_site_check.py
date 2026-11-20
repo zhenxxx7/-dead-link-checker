@@ -347,6 +347,7 @@ def wait_for_scan_completion(
     last_submission = 0.0
     last_manual_prompt = ""
     consecutive_captcha_attempts = 0
+    checked_at_last_captcha: int | None = None
     max_total_captcha_attempts = max(args.captcha_attempts * 4, 24)
 
     while True:
@@ -391,18 +392,30 @@ def wait_for_scan_completion(
                         raise CaptchaFailure("Provider image code did not load.") from exc
                     png = page.locator("#captcha").screenshot()
                     (run_dir / f"captcha-{metadata['captcha_attempts']}.png").write_bytes(png)
-                    code = captcha_code(png)
-                    print(
-                        f"Image code attempt {metadata['captcha_attempts']} "
-                        f"(challenge try {consecutive_captcha_attempts}/{args.captcha_attempts}): "
-                        f"OCR read {len(code)} characters.",
-                        flush=True,
-                    )
+                    try:
+                        code = captcha_code(png)
+                        print(
+                            f"Image code attempt {metadata['captcha_attempts']} "
+                            f"(challenge try {consecutive_captcha_attempts}/{args.captcha_attempts}): "
+                            f"OCR read {len(code)} characters.",
+                            flush=True,
+                        )
+                    except CaptchaFailure:
+                        # Submit a placeholder code so the provider serves a fresh image
+                        # instead of aborting the entire scan over one overlapping CAPTCHA.
+                        code = "AAA"
+                        print(
+                            f"Image code attempt {metadata['captcha_attempts']} "
+                            f"(challenge try {consecutive_captcha_attempts}/{args.captcha_attempts}): "
+                            "OCR unreadable; requesting a fresh image code.",
+                            flush=True,
+                        )
                     field = page.locator("#captchatxt")
                     field.fill("")
                     field.press_sequentially(code, delay=50)
                     page.locator("#btn0").click(timeout=10000)
                     submitted_sources.add(src)
+                    checked_at_last_captcha = snapshot.get("checked") or 0
                     last_submission = time.monotonic()
                 elif time.monotonic() - last_submission > CAPTCHA_RESPONSE_SECONDS:
                     raise CaptchaFailure("Provider did not advance after image code entry.")
@@ -413,9 +426,14 @@ def wait_for_scan_completion(
                     flush=True,
                 )
                 last_manual_prompt = src
-        else:
-            # Captcha passed and scanning resumed; reset per-challenge counter.
+        elif (
+            checked_at_last_captcha is not None
+            and snapshot.get("state") in (1, 2)
+            and (snapshot.get("checked") or 0) > checked_at_last_captcha
+        ):
+            # Captcha truly cleared and the scan checked additional URLs; reset challenge counter.
             consecutive_captcha_attempts = 0
+            checked_at_last_captcha = None
 
         now = time.monotonic()
         if now - last_progress_log >= 30:
@@ -452,8 +470,8 @@ def try_click_retry_dead_links(page) -> bool:
 def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | None]:
     started = datetime.now(SGT)
     sheet_name = (getattr(args, "sheet_name", None) or default_sheet_name(args.target)).strip()
-    dead_link_retries = getattr(args, "dead_link_retries", 2)
-    dead_link_retry_delay = getattr(args, "dead_link_retry_delay_seconds", 45)
+    dead_link_retries = getattr(args, "dead_link_retries", 4)
+    dead_link_retry_delay = getattr(args, "dead_link_retry_delay_seconds", 300)
     run_dir = Path(args.output_dir) / (
         started.strftime("%Y-%m-%d_%H-%M-%S_SGT") + f"_attempt-{attempt_number}"
     )
@@ -515,9 +533,12 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
                 max_timeout_rows=args.max_timeout_rows,
             )
 
-            # In-place recovery: use the provider's own 'Retry dead links' button
-            # to re-check timed-out pages and continue crawling without restarting at 0.
+            # In-place recovery: wait for origin rate limits to cool down, then use the
+            # provider's own 'Retry dead links' button so already-OK URLs stay checked
+            # while timed-out pages are retried and crawled incrementally.
             while issues and metadata["dead_link_retries"] < dead_link_retries:
+                prev_checked = snapshot.get("checked") or 0
+                prev_timeouts = sum(1 for row in rows if row and "timeout" in row[0].lower())
                 next_retry = metadata["dead_link_retries"] + 1
                 print(
                     f"Provider report inconclusive ({'; '.join(issues)}); "
@@ -540,6 +561,15 @@ def run(args: argparse.Namespace, attempt_number: int = 1) -> tuple[int, str | N
                     min_checked=args.min_checked,
                     max_timeout_rows=args.max_timeout_rows,
                 )
+                cur_checked = snapshot.get("checked") or 0
+                cur_timeouts = sum(1 for row in rows if row and "timeout" in row[0].lower())
+                if issues and cur_checked <= prev_checked and cur_timeouts >= prev_timeouts:
+                    print(
+                        f"In-place 'Retry dead links' made no progress "
+                        f"({cur_checked} checked, {cur_timeouts} timeouts); stopping in-place retries.",
+                        flush=True,
+                    )
+                    break
 
             metadata["scan_complete"] = True
             metadata["state"] = "complete"
@@ -643,8 +673,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scan-attempts", type=int, default=3)
     parser.add_argument("--retry-delay-seconds", type=int, default=20)
     parser.add_argument("--quality-retry-delay-seconds", type=int, default=300)
-    parser.add_argument("--dead-link-retries", type=int, default=2)
-    parser.add_argument("--dead-link-retry-delay-seconds", type=int, default=45)
+    parser.add_argument("--dead-link-retries", type=int, default=4)
+    parser.add_argument("--dead-link-retry-delay-seconds", type=int, default=300)
     parser.add_argument("--min-checked", type=int, default=0)
     parser.add_argument("--max-timeout-rows", type=int)
     parser.add_argument("--headed", action="store_true", help="Show browser during OCR mode")

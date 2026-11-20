@@ -187,6 +187,55 @@ class CaptchaPreprocessingTests(unittest.TestCase):
         self.assertEqual(final["checked"], 221)
         self.assertEqual(metadata["captcha_attempts"], 4)
 
+    def test_unreadable_captcha_requests_fresh_image_instead_of_aborting(self):
+        snapshots = [
+            {
+                "state": 4, "percent": 0, "checked": 0, "failed": 0, "denied": 0,
+                "status_text": "stopped", "statistics_text": "", "captcha_visible": True,
+                "captcha_src": "https://www.deadlinkchecker.com/sec.asp?r=1",
+                "limited": False, "concurrent": False, "report_ready": False,
+                "scanned_url": "https://www.emre.com.sg/",
+                "current_page": checker.SITE_CHECK_URL,
+            },
+            {
+                "state": 4, "percent": 0, "checked": 0, "failed": 0, "denied": 0,
+                "status_text": "stopped", "statistics_text": "", "captcha_visible": True,
+                "captcha_src": "https://www.deadlinkchecker.com/sec.asp?r=2",
+                "limited": False, "concurrent": False, "report_ready": False,
+                "scanned_url": "https://www.emre.com.sg/",
+                "current_page": checker.SITE_CHECK_URL,
+            },
+            {
+                "state": 3, "percent": 100, "checked": 221, "failed": 2, "denied": 0,
+                "status_text": "Scan completed with 2 errors.", "statistics_text": "100%",
+                "captcha_visible": False, "captcha_src": "", "limited": False,
+                "concurrent": False, "report_ready": True,
+                "scanned_url": "https://www.emre.com.sg/",
+                "current_page": checker.SITE_CHECK_URL,
+            },
+        ]
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.locator.return_value.screenshot.return_value = b"fake-png"
+        args = SimpleNamespace(
+            target="https://www.emre.com.sg/",
+            ocr_captcha=True,
+            captcha_attempts=4,
+        )
+        metadata = {"captcha_attempts": 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(checker, "browser_snapshot", side_effect=snapshots):
+                with patch.object(
+                    checker,
+                    "captcha_code",
+                    side_effect=[checker.CaptchaFailure("unreadable"), "WXYZ"],
+                ):
+                    final = checker.wait_for_scan_completion(
+                        page, args, Path(tmp), metadata, set()
+                    )
+        self.assertEqual(final["checked"], 221)
+        self.assertEqual(metadata["captcha_attempts"], 2)
+
 
 class InPlaceRetryRecoveryTests(unittest.TestCase):
     def test_recovers_inconclusive_scan_via_retry_dead_links(self):
@@ -260,6 +309,60 @@ class InPlaceRetryRecoveryTests(unittest.TestCase):
             second_rows,
             sheet_name="emservices",
         )
+
+    def test_stops_in_place_retries_early_when_no_progress(self):
+        stuck_snap = {
+            "state": 3, "percent": 100, "checked": 285, "failed": 61, "denied": 0,
+            "status_text": "Scan completed with 61 errors.",
+            "statistics_text": "100% scanned - 285/285 URLs checked, 224 OK, 61 failed",
+            "captcha_visible": False, "captcha_src": "", "limited": False,
+            "concurrent": False, "report_ready": True,
+            "scanned_url": "https://www.emservices.com.sg/",
+            "current_page": checker.SITE_CHECK_URL,
+        }
+        stuck_rows = [["-1 Timeout", "https://www.emservices.com.sg", "<No Text>"]] * 15
+
+        fake_page = MagicMock()
+        fake_page.is_closed.return_value = False
+        fake_page.evaluate.return_value = "<html>DeadLinkChecker.com - report</html>"
+        fake_page.content.return_value = "<html>ok</html>"
+        fake_context = MagicMock()
+        fake_context.new_page.return_value = fake_page
+        fake_browser = MagicMock()
+        fake_browser.new_context.return_value = fake_context
+        fake_pw = MagicMock()
+        fake_pw.chromium.launch.return_value = fake_browser
+        fake_cm = MagicMock()
+        fake_cm.__enter__.return_value = fake_pw
+        fake_cm.__exit__.return_value = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = checker.parse_args(
+                [
+                    "--target", "https://www.emservices.com.sg/",
+                    "--sheet-name", "emservices",
+                    "--output-dir", tmp,
+                    "--min-checked", "800",
+                    "--max-timeout-rows", "10",
+                    "--dead-link-retries", "4",
+                    "--dead-link-retry-delay-seconds", "0",
+                    "--scan-attempts", "2",
+                    "--ocr-captcha",
+                ]
+            )
+            with (
+                patch.object(checker, "sync_playwright", return_value=fake_cm),
+                patch.object(
+                    checker, "wait_for_scan_completion", side_effect=[stuck_snap, stuck_snap]
+                ),
+                patch.object(checker, "result_rows", side_effect=[stuck_rows, stuck_rows]),
+                patch.object(checker, "try_click_retry_dead_links", return_value=True) as retry_click,
+            ):
+                exit_code, retry_reason = checker.run(args, attempt_number=1)
+
+        self.assertEqual((exit_code, retry_reason), (1, "quality"))
+        # Stopped after 1 unproductive retry instead of burning all 4.
+        retry_click.assert_called_once_with(fake_page)
 
 
 class ReportQualityTests(unittest.TestCase):
