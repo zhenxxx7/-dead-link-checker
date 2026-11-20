@@ -125,14 +125,6 @@ def status_label_and_style(meta: dict | None) -> tuple[str, PatternFill, Font]:
     return "SCAN FAILED", RED_FILL, RED_FONT
 
 
-def github_run_url(meta: dict | None) -> str:
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    run_id = (meta or {}).get("github_run_id") or os.environ.get("GITHUB_RUN_ID", "")
-    if repo and run_id:
-        return f"https://github.com/{repo}/actions/runs/{run_id}"
-    return "Local run"
-
-
 def format_notes(meta: dict | None) -> str:
     if not meta:
         return "No scan artifact found for this website."
@@ -289,7 +281,6 @@ def populate_site_sheet(
     ws.views.sheetView[0].showGridLines = True
 
     label, st_fill, st_font = status_label_and_style(meta)
-    run_url = github_run_url(meta)
 
     ws.merge_cells("A1:D1")
     ws["A1"] = f"Dead Link Report — {site['target']}"
@@ -306,7 +297,6 @@ def populate_site_sheet(
             (meta or {}).get("provider_statistics", "").replace("\n", " | ")
             or format_notes(meta),
         ),
-        ("Run Link", run_url),
     ]
     for offset, (key, val) in enumerate(info_rows, start=2):
         ws.row_dimensions[offset].height = 20
@@ -325,13 +315,10 @@ def populate_site_sheet(
         if key == "Status":
             v_cell.fill = st_fill
             v_cell.font = st_font
-        elif key == "Run Link" and val.startswith("http"):
-            v_cell.hyperlink = val
-            v_cell.font = LINK_FONT
         else:
             v_cell.font = BODY_FONT
 
-    table_header_row = 7
+    table_header_row = 6
     ws.row_dimensions[table_header_row].height = 24
     headers = ["No", "Status", "URL", "Source Link Text"]
     for col_idx, heading in enumerate(headers, start=1):
@@ -342,9 +329,9 @@ def populate_site_sheet(
         cell.border = THIN_BORDER
 
     if not meta or not meta.get("quality_passed"):
-        ws.merge_cells(start_row=8, start_column=1, end_row=8, end_column=4)
+        ws.merge_cells(start_row=7, start_column=1, end_row=7, end_column=4)
         notice = ws.cell(
-            8,
+            7,
             1,
             f"Report withheld ({label}): {format_notes(meta)}",
         )
@@ -353,18 +340,18 @@ def populate_site_sheet(
         notice.alignment = Alignment(vertical="center", wrap_text=True)
         notice.border = THIN_BORDER
         for extra_col in (2, 3, 4):
-            ws.cell(8, extra_col).border = THIN_BORDER
-        ws.row_dimensions[8].height = 26
+            ws.cell(7, extra_col).border = THIN_BORDER
+        ws.row_dimensions[7].height = 26
     elif not rows:
-        ws.merge_cells(start_row=8, start_column=1, end_row=8, end_column=4)
-        ok_cell = ws.cell(8, 1, "No broken links found in this completed scan.")
+        ws.merge_cells(start_row=7, start_column=1, end_row=7, end_column=4)
+        ok_cell = ws.cell(7, 1, "No broken links found in this completed scan.")
         ok_cell.fill = GREEN_FILL
         ok_cell.font = GREEN_FONT
         ok_cell.alignment = Alignment(vertical="center")
         ok_cell.border = THIN_BORDER
         for extra_col in (2, 3, 4):
-            ws.cell(8, extra_col).border = THIN_BORDER
-        ws.row_dimensions[8].height = 24
+            ws.cell(7, extra_col).border = THIN_BORDER
+        ws.row_dimensions[7].height = 24
     else:
         for idx, row in enumerate(rows, start=1):
             r = table_header_row + idx

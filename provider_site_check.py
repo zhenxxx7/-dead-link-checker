@@ -242,17 +242,13 @@ def spreadsheet_batch(
     rows: list[list[str]],
     *,
     stamp: str,
-    run_id: str,
-    event_name: str,
-    repository: str,
-    status: str,
-    note: str,
+    run_id: str = "",
+    event_name: str = "",
+    repository: str = "",
+    status: str = "SCAN COMPLETE",
+    note: str = "",
 ) -> list[list[str]]:
-    run_url = (
-        f"https://github.com/{repository}/actions/runs/{run_id}"
-        if repository and run_id
-        else "Local run"
-    )
+    del run_id, repository  # Do not expose GitHub repository or Actions links in client sheets.
     details = (
         "Dead Link Checker Site Check; "
         f"{snapshot['percent']}% scanned; {snapshot['checked']} checked; "
@@ -262,7 +258,7 @@ def spreadsheet_batch(
         details += f"; {note}"
     return [
         ["\u00a0", "\u00a0", "\u00a0", "\u00a0"],
-        [stamp, f"SCAN START ({event_name or 'local'})", target, run_url],
+        [stamp, f"SCAN START ({event_name or 'local'})", target, ""],
         [stamp, status, target, details],
         *[[stamp, *row] for row in rows],
     ]

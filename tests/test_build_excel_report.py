@@ -168,16 +168,22 @@ class BuildExcelReportTests(unittest.TestCase):
 
             # Verify site isolation: emservices only has emservices links, commercial.yoha only its own.
             ws_em = wb["emservices"]
-            self.assertEqual(ws_em["C8"].value, "https://www.emservices.com.sg/xmlrpc.php?rsd")
-            self.assertIsNone(ws_em["C9"].value)
+            self.assertEqual(ws_em["C7"].value, "https://www.emservices.com.sg/xmlrpc.php?rsd")
+            self.assertIsNone(ws_em["C8"].value)
 
             ws_yoha = wb["commercial.yoha"]
-            self.assertEqual(ws_yoha["C8"].value, "http://www.eemusic.com.sg/contact-us/")
-            self.assertEqual(ws_yoha["C9"].value, "https://www.commercial.yoha.com.sg/xmlrpc.php?rsd")
+            self.assertEqual(ws_yoha["C7"].value, "http://www.eemusic.com.sg/contact-us/")
+            self.assertEqual(ws_yoha["C8"].value, "https://www.commercial.yoha.com.sg/xmlrpc.php?rsd")
 
             # Inconclusive site withholds raw timeout rows.
             ws_eng = wb["emengineering"]
-            self.assertIn("Report withheld (SCAN INCONCLUSIVE)", ws_eng["A8"].value)
+            self.assertIn("Report withheld (SCAN INCONCLUSIVE)", ws_eng["A7"].value)
+
+            # Never expose GitHub Actions URLs anywhere in the workbook.
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    for cell in row:
+                        self.assertNotIn("github.com", str(cell or "").lower())
 
 
 if __name__ == "__main__":

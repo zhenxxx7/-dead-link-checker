@@ -424,9 +424,9 @@ class SpreadsheetBatchTests(unittest.TestCase):
         self.assertEqual([len(row) for row in batch], [4, 4, 4, 4])
         self.assertEqual(batch[0], ["\u00a0"] * 4)
         self.assertEqual(batch[1][1], "SCAN START (workflow_dispatch)")
-        self.assertEqual(
-            batch[1][3],
-            "https://github.com/zhenxxx7/-dead-link-checker/actions/runs/36975026323",
+        self.assertEqual(batch[1][3], "")
+        self.assertFalse(
+            any("github.com" in str(cell).lower() for row in batch for cell in row)
         )
         self.assertEqual(batch[2][1], "SCAN COMPLETE")
         self.assertEqual(batch[3][1], "403 Forbidden")
