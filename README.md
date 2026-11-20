@@ -13,14 +13,14 @@ Each website is checked in its own separate job and reported to its own dedicate
 | `emengineering` | `https://www.emengineering.com.sg/` | 150 | 10 |
 | `emre` | `https://www.emre.com.sg/` | 150 | 10 |
 
-## GitHub Actions (Separate & Parallel Workflows)
+## GitHub Actions (Separate Workflows per Website)
 
-Each website has its own independent workflow running simultaneously at **06:00, 13:00, and 19:00 Singapore time / WITA** (UTC+8 — `22:00`, `05:00`, `11:00` UTC), and can also be triggered individually anytime:
+Each website has its own independent workflow scheduled 3x daily (Singapore time / WITA, UTC+8) — staggered 10 minutes apart so all four sites finish inside ~45 minutes without triggering origin rate limits on their shared AWS Singapore servers (`13.251.10.125`, `3.1.11.209`) — and can also be triggered individually anytime:
 
-- [`Check — emservices`](.github/workflows/check_emservices.yml)
-- [`Check — commercial.yoha`](.github/workflows/check_commercial_yoha.yml)
-- [`Check — emengineering`](.github/workflows/check_emengineering.yml)
-- [`Check — emre`](.github/workflows/check_emre.yml)
+- [`Check — emre`](.github/workflows/check_emre.yml) — `06:00`, `13:00`, `19:00` SGT
+- [`Check — emengineering`](.github/workflows/check_emengineering.yml) — `06:10`, `13:10`, `19:10` SGT
+- [`Check — commercial.yoha`](.github/workflows/check_commercial_yoha.yml) — `06:20`, `13:20`, `19:20` SGT
+- [`Check — emservices`](.github/workflows/check_emservices.yml) — `06:30`, `13:30`, `19:30` SGT
 - [`Provider Site Check (All Sites — Manual Parallel)`](.github/workflows/provider_site_check.yml) — manual trigger to run all 4 sites in parallel and download a single combined multi-sheet Excel workbook (`dead-link-report-<run_id>.xlsx`).
 
 - **Parallel & independent execution**: all four websites run concurrently in separate workflows so one slow or failing website never delays or fails the other three.

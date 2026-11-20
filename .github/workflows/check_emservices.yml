@@ -2,10 +2,11 @@ name: Check — emservices
 
 on:
   schedule:
-    # 06:00, 13:00, and 19:00 Singapore time / WITA (UTC+8).
-    - cron: '0 22 * * *'
-    - cron: '0 5 * * *'
-    - cron: '0 11 * * *'
+    # 06:30, 13:30, and 19:30 Singapore time / WITA (UTC+8).
+    # Staggered after the smaller sites because all 4 sites share the same origin servers.
+    - cron: '30 22 * * *'
+    - cron: '30 5 * * *'
+    - cron: '30 11 * * *'
   workflow_dispatch:
 
 concurrency:
